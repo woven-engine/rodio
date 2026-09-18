@@ -41,11 +41,6 @@ where
     /// and discards samples for down-sampling. This may introduce audible
     /// distortions in some cases (see [#584](https://github.com/RustAudio/rodio/issues/584)).
     ///
-    /// # Limitations
-    /// Some rate conversions where target rate is high and rates are mutual primes the sample
-    /// interpolation may cause numeric overflows. Conversion between usual sample rates
-    /// 2400, 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, ... is expected to work.
-    ///
     /// # Panic
     /// Panics if `from`, `to` or `num_channels` are 0.
     #[inline]
@@ -154,8 +149,8 @@ where
             self.current_span_pos_in_chunk = 0;
         } else {
             // Finding the position of the first sample of the linear interpolation.
-            let req_left_sample =
-                (self.from * self.next_output_span_pos_in_chunk / self.to) % self.from;
+            let position = u64::from(self.from) * u64::from(self.next_output_span_pos_in_chunk);
+            let req_left_sample = ((position / u64::from(self.to)) % u64::from(self.from)) as u32;
 
             // Advancing `self.current_span`, `self.next_span` and
             // `self.current_span_pos_in_chunk` until the latter variable
@@ -170,7 +165,8 @@ where
         // Note that `self.output_buffer` can be truncated if there is not enough data in
         // `self.next_span`.
         let mut result = None;
-        let numerator = (self.from * self.next_output_span_pos_in_chunk) % self.to;
+        let numerator = ((u64::from(self.from) * u64::from(self.next_output_span_pos_in_chunk))
+            % u64::from(self.to)) as u32;
         for (off, (cur, next)) in self
             .current_span
             .iter()
@@ -248,6 +244,25 @@ mod test {
     use crate::Sample;
     use core::time::Duration;
     use quickcheck::{quickcheck, TestResult};
+
+    #[test]
+    fn pitched_rates_preserve_a_ramp_without_overflow() {
+        for (from, to) in [(48_001, 192_000), (192_001, 48_000)] {
+            let source = (0..from * 2).map(|index| index as Sample / from as Sample);
+            let converted = SampleRateConverter::new(
+                source,
+                SampleRate::new(from).unwrap(),
+                SampleRate::new(to).unwrap(),
+                nz!(1),
+            );
+            let samples = converted.take(to as usize).collect::<Vec<_>>();
+            assert_eq!(samples.len(), to as usize);
+            for (index, actual) in samples.into_iter().enumerate() {
+                let expected = index as Sample / to as Sample;
+                assert!((actual - expected).abs() < 0.000_01);
+            }
+        }
+    }
 
     quickcheck! {
         /// Check that resampling an empty input produces no output.
