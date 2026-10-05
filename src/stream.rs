@@ -20,19 +20,29 @@
 //! please contribute your solution to us!
 use crate::common::{assert_error_traits, ChannelCount, SampleRate};
 use crate::math::{nearest_multiple_of_two, nz};
-use crate::mixer::{mixer, Mixer};
+use crate::mixer::{mixer, Mixer, MixerSource};
 use crate::player::Player;
 use crate::{decoder, Source};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{BufferSize, Sample, SampleFormat, StreamConfig, I24};
+use cpal::{BufferSize, FromSample, Sample, SampleFormat, StreamConfig, I24};
 use std::fmt;
 use std::io::{Read, Seek};
 use std::marker::Sync;
 use std::num::NonZero;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::{mpsc, Arc, Mutex};
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Duration;
 
 const HZ_44100: SampleRate = nz!(44_100);
 
 /// `cpal::Stream` container. Use `mixer()` method to control output.
+///
+/// A sink opened for the default device with
+/// [`DeviceSinkBuilder::open_default_sink`] or
+/// [`DeviceSinkBuilder::from_default_device`] keeps playing on the system
+/// default output: when the default changes, or the current device disappears,
+/// the sink reopens its stream on the new default device with the same mixer.
 ///
 /// <div class="warning">When dropped playback will end, and the associated
 /// OS-Sink will be disposed</div>
@@ -59,7 +69,16 @@ pub struct MixerDeviceSink {
     config: DeviceSinkConfig,
     mixer: Mixer,
     log_on_drop: bool,
-    _stream: cpal::Stream,
+    _output: SinkOutput,
+}
+
+/// The OS output that plays a sink's mixer.
+enum SinkOutput {
+    /// A stream on one explicitly chosen device.
+    Device(#[allow(dead_code)] cpal::Stream),
+    /// A stream that moves to whichever device is the system default.
+    #[cfg(not(target_arch = "wasm32"))]
+    DefaultDevice(#[allow(dead_code)] DefaultDeviceFollower),
 }
 
 impl MixerDeviceSink {
@@ -156,6 +175,7 @@ impl core::fmt::Debug for DeviceSinkBuilder {
 
         f.debug_struct("DeviceSinkBuilder")
             .field("device", &device)
+            .field("follows_default_device", &self.follows_default_device)
             .field("config", &self.config)
             .finish()
     }
@@ -179,6 +199,7 @@ where
     E: FnMut(cpal::StreamError) + Send + 'static,
 {
     device: Option<cpal::Device>,
+    follows_default_device: bool,
     config: DeviceSinkConfig,
     error_callback: E,
 }
@@ -187,6 +208,7 @@ impl Default for DeviceSinkBuilder {
     fn default() -> Self {
         Self {
             device: None,
+            follows_default_device: false,
             config: DeviceSinkConfig::default(),
             error_callback: default_error_callback,
         }
@@ -219,11 +241,16 @@ impl DeviceSinkBuilder {
     }
 
     /// Sets default OS-Sink parameters for default output audio device.
+    ///
+    /// The opened sink follows the system default output device until another
+    /// device is chosen with [`DeviceSinkBuilder::with_device`].
     pub fn from_default_device() -> Result<DeviceSinkBuilder, DeviceSinkError> {
         let default_device = cpal::default_host()
             .default_output_device()
             .ok_or(DeviceSinkError::NoDevice)?;
-        Self::from_device(default_device)
+        let mut builder = Self::from_device(default_device)?;
+        builder.follows_default_device = true;
+        Ok(builder)
     }
 
     /// Try to open a new OS-Sink for the default output device with its default configuration.
@@ -269,6 +296,7 @@ where
     /// To also set parameters that are appropriate for the device use [Self::from_device()] instead.
     pub fn with_device(mut self, device: cpal::Device) -> DeviceSinkBuilder<E> {
         self.device = Some(device);
+        self.follows_default_device = false;
         self
     }
 
@@ -371,6 +399,7 @@ where
     {
         DeviceSinkBuilder {
             device: self.device,
+            follows_default_device: self.follows_default_device,
             config: self.config,
             error_callback: callback,
         }
@@ -378,9 +407,17 @@ where
 
     /// Open OS-Sink using parameters configured so far.
     pub fn open_stream(self) -> Result<MixerDeviceSink, DeviceSinkError> {
-        let device = self.device.as_ref().expect("No output device specified");
+        let device = self.device.expect("No output device specified");
 
-        MixerDeviceSink::open(device, &self.config, self.error_callback)
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.follows_default_device {
+            return MixerDeviceSink::open_following_default(
+                device,
+                &self.config,
+                self.error_callback,
+            );
+        }
+        MixerDeviceSink::open(&device, &self.config, self.error_callback)
     }
 
     /// Try opening a new OS-Sink with the builder's current stream configuration.
@@ -495,10 +532,10 @@ impl MixerDeviceSink {
     {
         Self::validate_config(config);
         let (controller, source) = mixer(config.channel_count, config.sample_rate);
-        Self::init_stream(device, config, source, error_callback).and_then(|stream| {
+        Self::init_stream(device, config, OwnedFeed(source), error_callback).and_then(|stream| {
             stream.play().map_err(DeviceSinkError::PlayError)?;
             Ok(Self {
-                _stream: stream,
+                _output: SinkOutput::Device(stream),
                 mixer: controller,
                 config: *config,
                 log_on_drop: true,
@@ -506,14 +543,34 @@ impl MixerDeviceSink {
         })
     }
 
-    fn init_stream<S, E>(
+    #[cfg(not(target_arch = "wasm32"))]
+    fn open_following_default<E>(
+        device: cpal::Device,
+        config: &DeviceSinkConfig,
+        error_callback: E,
+    ) -> Result<MixerDeviceSink, DeviceSinkError>
+    where
+        E: FnMut(cpal::StreamError) + Send + 'static,
+    {
+        Self::validate_config(config);
+        let (controller, source) = mixer(config.channel_count, config.sample_rate);
+        let follower = DefaultDeviceFollower::start(device, *config, source, error_callback)?;
+        Ok(Self {
+            _output: SinkOutput::DefaultDevice(follower),
+            mixer: controller,
+            config: *config,
+            log_on_drop: true,
+        })
+    }
+
+    fn init_stream<F, E>(
         device: &cpal::Device,
         config: &DeviceSinkConfig,
-        mut samples: S,
+        mut feed: F,
         error_callback: E,
     ) -> Result<cpal::Stream, DeviceSinkError>
     where
-        S: Source + Send + 'static,
+        F: OutputFeed,
         E: FnMut(cpal::StreamError) + Send + 'static,
     {
         let cpal_config = config.into();
@@ -524,14 +581,7 @@ impl MixerDeviceSink {
                     $(
                         cpal::SampleFormat::$sample_format => device.build_output_stream::<$generic, _, _>(
                             &cpal_config,
-                            move |data, _| {
-                                data.iter_mut().for_each(|d| {
-                                    *d = samples
-                                        .next()
-                                        .map(Sample::from_sample)
-                                        .unwrap_or(<$generic>::EQUILIBRIUM)
-                                })
-                            },
+                            move |data, _| feed.fill(data),
                             error_callback,
                             None,
                         ),
@@ -557,6 +607,313 @@ impl MixerDeviceSink {
         );
 
         result.map_err(DeviceSinkError::BuildError)
+    }
+}
+
+/// Writes mixer output into one device buffer.
+trait OutputFeed: Send + 'static {
+    fn fill<T>(&mut self, data: &mut [T])
+    where
+        T: Sample + FromSample<crate::Sample>;
+}
+
+/// A source owned by a single stream callback.
+struct OwnedFeed<S>(S);
+
+impl<S> OutputFeed for OwnedFeed<S>
+where
+    S: Source + Send + 'static,
+{
+    fn fill<T>(&mut self, data: &mut [T])
+    where
+        T: Sample + FromSample<crate::Sample>,
+    {
+        data.iter_mut().for_each(|d| {
+            *d = self
+                .0
+                .next()
+                .map(Sample::from_sample)
+                .unwrap_or(T::EQUILIBRIUM)
+        })
+    }
+}
+
+/// A mixer output that successive streams share as the default device
+/// changes. A callback locks it once per buffer.
+#[cfg(not(target_arch = "wasm32"))]
+type SharedMixerSource = Arc<Mutex<MixerSource>>;
+
+#[cfg(not(target_arch = "wasm32"))]
+type SharedErrorCallback = Arc<Mutex<dyn FnMut(cpal::StreamError) + Send>>;
+
+#[cfg(not(target_arch = "wasm32"))]
+struct SharedFeed(SharedMixerSource);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl OutputFeed for SharedFeed {
+    fn fill<T>(&mut self, data: &mut [T])
+    where
+        T: Sample + FromSample<crate::Sample>,
+    {
+        let Ok(mut source) = self.0.lock() else {
+            data.fill(T::EQUILIBRIUM);
+            return;
+        };
+        data.iter_mut().for_each(|d| {
+            *d = source
+                .next()
+                .map(Sample::from_sample)
+                .unwrap_or(T::EQUILIBRIUM)
+        })
+    }
+}
+
+/// Reads a shared mixer one sample at a time, so a converter can adapt it to
+/// a device that rejects the mixer's format.
+#[cfg(not(target_arch = "wasm32"))]
+struct SharedSourceReader {
+    source: SharedMixerSource,
+    channels: ChannelCount,
+    sample_rate: SampleRate,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Iterator for SharedSourceReader {
+    type Item = crate::Sample;
+
+    fn next(&mut self) -> Option<crate::Sample> {
+        self.source.lock().ok()?.next()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Source for SharedSourceReader {
+    fn current_span_len(&self) -> Option<usize> {
+        None
+    }
+
+    fn channels(&self) -> ChannelCount {
+        self.channels
+    }
+
+    fn sample_rate(&self) -> SampleRate {
+        self.sample_rate
+    }
+
+    fn total_duration(&self) -> Option<std::time::Duration> {
+        None
+    }
+}
+
+/// How often the follower checks whether the system default output changed.
+#[cfg(not(target_arch = "wasm32"))]
+const DEFAULT_DEVICE_POLL: Duration = Duration::from_millis(500);
+
+#[cfg(not(target_arch = "wasm32"))]
+enum FollowerEvent {
+    /// The stream with this generation lost its device.
+    DeviceLost(u64),
+    /// The sink was dropped.
+    Stop,
+}
+
+/// Keeps a sink's mixer playing on the system default output device. A
+/// dedicated thread owns the output stream and reopens it on the new default
+/// device when the default changes or the current device disappears.
+#[cfg(not(target_arch = "wasm32"))]
+struct DefaultDeviceFollower {
+    events: mpsc::Sender<FollowerEvent>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct FollowedStream {
+    device: Option<cpal::DeviceId>,
+    generation: u64,
+    _stream: cpal::Stream,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct DefaultDeviceStreams {
+    config: DeviceSinkConfig,
+    source: SharedMixerSource,
+    error_callback: SharedErrorCallback,
+    events: mpsc::Sender<FollowerEvent>,
+    generation: u64,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl DefaultDeviceStreams {
+    /// Opens a playing stream for the shared mixer on `device`, converting the
+    /// mixer's format when the device rejects it.
+    fn open(&mut self, device: &cpal::Device) -> Result<FollowedStream, DeviceSinkError> {
+        self.generation += 1;
+        let generation = self.generation;
+        let on_error = {
+            let error_callback = self.error_callback.clone();
+            let events = self.events.clone();
+            move |err: cpal::StreamError| {
+                if matches!(err, cpal::StreamError::DeviceNotAvailable) {
+                    let _ = events.send(FollowerEvent::DeviceLost(generation));
+                }
+                if let Ok(mut callback) = error_callback.lock() {
+                    callback(err);
+                }
+            }
+        };
+        let stream = MixerDeviceSink::init_stream(
+            device,
+            &self.config,
+            SharedFeed(self.source.clone()),
+            on_error.clone(),
+        )
+        .or_else(|original_err| {
+            let device_config = DeviceSinkBuilder::from_device(device.clone())
+                .map_err(|_| original_err)?
+                .config;
+            let reader = SharedSourceReader {
+                source: self.source.clone(),
+                channels: self.config.channel_count,
+                sample_rate: self.config.sample_rate,
+            };
+            let converted = crate::source::UniformSourceIterator::new(
+                reader,
+                device_config.channel_count,
+                device_config.sample_rate,
+            );
+            MixerDeviceSink::init_stream(device, &device_config, OwnedFeed(converted), on_error)
+        })?;
+        stream.play().map_err(DeviceSinkError::PlayError)?;
+        Ok(FollowedStream {
+            device: device.id().ok(),
+            generation,
+            _stream: stream,
+        })
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl DefaultDeviceFollower {
+    fn start<E>(
+        device: cpal::Device,
+        config: DeviceSinkConfig,
+        source: MixerSource,
+        error_callback: E,
+    ) -> Result<Self, DeviceSinkError>
+    where
+        E: FnMut(cpal::StreamError) + Send + 'static,
+    {
+        let (events, receiver) = mpsc::channel();
+        let mut streams = DefaultDeviceStreams {
+            config,
+            source: Arc::new(Mutex::new(source)),
+            error_callback: Arc::new(Mutex::new(error_callback)),
+            events: events.clone(),
+            generation: 0,
+        };
+        let (opened, initial) = mpsc::sync_channel(1);
+        // The stream is created, replaced, and dropped on this one thread, so
+        // the sink does not depend on streams being movable between threads.
+        let thread = std::thread::Builder::new()
+            .name("rodio default output".to_owned())
+            .spawn(move || {
+                let current = match streams.open(&device) {
+                    Ok(stream) => {
+                        let _ = opened.send(Ok(()));
+                        Some(stream)
+                    }
+                    Err(err) => {
+                        let _ = opened.send(Err(err));
+                        return;
+                    }
+                };
+                follow_default_device(streams, current, receiver);
+            })
+            .map_err(|err| {
+                DeviceSinkError::BuildError(cpal::BuildStreamError::BackendSpecific {
+                    err: cpal::BackendSpecificError {
+                        description: format!("could not start the default output thread: {err}"),
+                    },
+                })
+            })?;
+        match initial.recv() {
+            Ok(Ok(())) => Ok(Self {
+                events,
+                thread: Some(thread),
+            }),
+            Ok(Err(err)) => {
+                let _ = thread.join();
+                Err(err)
+            }
+            Err(_) => {
+                let _ = thread.join();
+                Err(DeviceSinkError::NoDevice)
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn follow_default_device(
+    mut streams: DefaultDeviceStreams,
+    mut current: Option<FollowedStream>,
+    events: mpsc::Receiver<FollowerEvent>,
+) {
+    let mut reported_failure = false;
+    loop {
+        let lost = match events.recv_timeout(DEFAULT_DEVICE_POLL) {
+            Ok(FollowerEvent::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Ok(FollowerEvent::DeviceLost(generation)) => current
+                .as_ref()
+                .is_some_and(|stream| stream.generation == generation),
+            Err(mpsc::RecvTimeoutError::Timeout) => false,
+        };
+        let Some(default) = cpal::default_host().default_output_device() else {
+            // Keep a working stream while no default device is reported.
+            if lost {
+                current = None;
+            }
+            continue;
+        };
+        let default_id = default.id().ok();
+        // Without device identities the stream moves only when its device is lost.
+        let unchanged =
+            current
+                .as_ref()
+                .is_some_and(|stream| match (&stream.device, &default_id) {
+                    (Some(device), Some(default)) => device == default,
+                    _ => true,
+                });
+        if unchanged && !lost {
+            continue;
+        }
+        // Release the previous stream before its replacement takes the mixer.
+        current = None;
+        match streams.open(&default) {
+            Ok(stream) => {
+                reported_failure = false;
+                current = Some(stream);
+            }
+            Err(err) => {
+                if !reported_failure {
+                    reported_failure = true;
+                    #[cfg(feature = "tracing")]
+                    tracing::error!("could not move audio output to the default device: {err}");
+                    #[cfg(not(feature = "tracing"))]
+                    eprintln!("could not move audio output to the default device: {err}");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for DefaultDeviceFollower {
+    fn drop(&mut self) {
+        let _ = self.events.send(FollowerEvent::Stop);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
