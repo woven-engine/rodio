@@ -728,7 +728,7 @@ struct DefaultDeviceFollower {
 
 #[cfg(not(target_arch = "wasm32"))]
 struct FollowedStream {
-    device: Option<cpal::DeviceId>,
+    device: cpal::Device,
     generation: u64,
     _stream: cpal::Stream,
 }
@@ -785,7 +785,7 @@ impl DefaultDeviceStreams {
         })?;
         stream.play().map_err(DeviceSinkError::PlayError)?;
         Ok(FollowedStream {
-            device: device.id().ok(),
+            device: device.clone(),
             generation,
             _stream: stream,
         })
@@ -875,15 +875,10 @@ fn follow_default_device(
             }
             continue;
         };
-        let default_id = default.id().ok();
         // Without device identities the stream moves only when its device is lost.
-        let unchanged =
-            current
-                .as_ref()
-                .is_some_and(|stream| match (&stream.device, &default_id) {
-                    (Some(device), Some(default)) => device == default,
-                    _ => true,
-                });
+        let unchanged = current
+            .as_ref()
+            .is_some_and(|stream| same_device(&stream.device, &default).unwrap_or(true));
         if unchanged && !lost {
             continue;
         }
@@ -904,6 +899,27 @@ fn follow_default_device(
                 }
             }
         }
+    }
+}
+
+/// Whether two devices are the same endpoint, when their identities are known.
+///
+/// WASAPI devices compare endpoint IDs directly: cpal 0.17's `Device::id`
+/// never frees the ID string Windows allocates, and the follower checks the
+/// default device on every poll.
+#[cfg(not(target_arch = "wasm32"))]
+fn same_device(a: &cpal::Device, b: &cpal::Device) -> Option<bool> {
+    // WASAPI is the only Windows host unless cpal's ASIO feature is enabled.
+    #[cfg(target_os = "windows")]
+    #[allow(irrefutable_let_patterns)]
+    if let (cpal::platform::DeviceInner::Wasapi(a), cpal::platform::DeviceInner::Wasapi(b)) =
+        (a.as_inner(), b.as_inner())
+    {
+        return Some(a == b);
+    }
+    match (a.id(), b.id()) {
+        (Ok(a), Ok(b)) => Some(a == b),
+        _ => None,
     }
 }
 
